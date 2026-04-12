@@ -155,7 +155,7 @@ jobs:
           test -d public || (echo "::error::public/ not found after build" && exit 1)
           echo "Build output: $(du -sh public/ | cut -f1)"
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Login to Azure
         uses: azure/login@v3
