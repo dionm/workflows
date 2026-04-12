@@ -192,7 +192,7 @@ jobs:
             type=raw,value=production-${{ steps.version.outputs.sha_short }},enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ inputs.dockerfile }}
