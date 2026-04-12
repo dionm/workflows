@@ -171,13 +171,13 @@ jobs:
         id: version
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           elif [ -f package.json ]; then
-            echo "version=$(jq -r .version package.json)" >> $GITHUB_OUTPUT
+            echo "version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
           else
-            echo "version=1.0.0" >> $GITHUB_OUTPUT
+            echo "version=1.0.0" >> "$GITHUB_OUTPUT"
           fi
-          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
@@ -238,14 +238,12 @@ jobs:
 
       - name: Health check
         run: |
-          APP_URL="https://${{ secrets.WEBAPP_NAME_STAGING }}.azurewebsites.net"
-          sleep 30
           for i in {1..10}; do
-            if curl -f -s "$APP_URL${{ inputs.health_check_path }}" > /dev/null; then
+            if curl -f -s "https://${{ secrets.WEBAPP_NAME_STAGING }}.azurewebsites.net${{ inputs.health_check_path }}" > /dev/null; then
               echo "Health check passed (attempt $i)"; exit 0
             fi
             echo "Attempt $i failed, retrying in 30s..."
-            [ $i -eq 10 ] && exit 1
+            [ "$i" -eq 10 ] && exit 1
             sleep 30
           done
 
@@ -255,6 +253,7 @@ jobs:
       - name: Notify Teams (success)
         if: success() && env.TEAMS_WEBHOOK_URL != ''
         run: |
+          # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
             "type": "message",
             "attachments": [{
@@ -274,6 +273,7 @@ jobs:
       - name: Notify Teams (failure)
         if: failure() && env.TEAMS_WEBHOOK_URL != ''
         run: |
+          # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
             "type": "message",
             "attachments": [{
@@ -323,29 +323,28 @@ jobs:
 
       - name: Health check
         run: |
-          APP_URL="https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net"
           sleep 60
           for i in {1..15}; do
-            if curl -f -s "$APP_URL${{ inputs.health_check_path }}" > /dev/null; then
+            if curl -f -s "https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net${{ inputs.health_check_path }}" > /dev/null; then
               echo "Health check passed (attempt $i)"; exit 0
             fi
             echo "Attempt $i failed, retrying in 45s..."
-            [ $i -eq 15 ] && exit 1
+            [ "$i" -eq 15 ] && exit 1
             sleep 45
           done
 
       - name: Smoke test
         run: |
-          APP_URL="https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net"
           for i in {1..5}; do
-            if curl -f -s "$APP_URL" > /dev/null; then echo "Smoke test passed"; exit 0; fi
-            [ $i -eq 5 ] && exit 1
+            if curl -f -s "https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net" > /dev/null; then echo "Smoke test passed"; exit 0; fi
+            [ "$i" -eq 5 ] && exit 1
             sleep 15
           done
 
       - name: Notify Teams (success)
         if: success() && env.TEAMS_WEBHOOK_URL != ''
         run: |
+          # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
             "type": "message",
             "attachments": [{
@@ -365,6 +364,7 @@ jobs:
       - name: Notify Teams (failure)
         if: failure() && env.TEAMS_WEBHOOK_URL != ''
         run: |
+          # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
             "type": "message",
             "attachments": [{
@@ -394,7 +394,7 @@ jobs:
     steps:
       - name: Get version
         id: ver
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Login to Azure
         uses: azure/login@v2
@@ -414,19 +414,19 @@ jobs:
 
       - name: Health check
         run: |
-          APP_URL="https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net"
           sleep 60
           for i in {1..15}; do
-            if curl -f -s "$APP_URL${{ inputs.health_check_path }}" > /dev/null; then
+            if curl -f -s "https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net${{ inputs.health_check_path }}" > /dev/null; then
               echo "Health check passed (attempt $i)"; exit 0
             fi
-            [ $i -eq 15 ] && exit 1
+            [ "$i" -eq 15 ] && exit 1
             sleep 45
           done
 
       - name: Notify Teams (success)
         if: success() && env.TEAMS_WEBHOOK_URL != ''
         run: |
+          # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
             "type": "message",
             "attachments": [{
@@ -446,6 +446,7 @@ jobs:
       - name: Notify Teams (failure)
         if: failure() && env.TEAMS_WEBHOOK_URL != ''
         run: |
+          # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
             "type": "message",
             "attachments": [{
