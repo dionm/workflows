@@ -10,6 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     name: Lint workflow YAML
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run actionlint
         uses: raven-actions/actionlint@v2
