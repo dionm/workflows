@@ -310,8 +310,8 @@ jobs:
 
           # Update image tag - sed targets the image line for this service.
           # Adjust the pattern if your manifest structure differs.
-          sed -i "s|${{ env.REGISTRY }}/${{ inputs.image_name }}:.*|${IMAGE}|g" \
-            $(grep -rl "${{ inputs.image_name }}" . --include="*.yaml" --include="*.yml" | head -20)
+          grep -rl "${{ inputs.image_name }}" . --include="*.yaml" --include="*.yml" | head -20 | \
+            xargs sed -i "s|${{ env.REGISTRY }}/${{ inputs.image_name }}:.*|${IMAGE}|g"
 
           git add -A
           git commit -m "deploy(${{ inputs.image_name }}): promote production-${{ needs.build.outputs.sha-short }}"
@@ -471,8 +471,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
 
-          sed -i "s|${{ env.REGISTRY }}/${{ inputs.image_name }}:.*|${IMAGE}|g" \
-            $(grep -rl "${{ inputs.image_name }}" . --include="*.yaml" --include="*.yml" | head -20)
+          grep -rl "${{ inputs.image_name }}" . --include="*.yaml" --include="*.yml" | head -20 | \
+            xargs sed -i "s|${{ env.REGISTRY }}/${{ inputs.image_name }}:.*|${IMAGE}|g"
 
           git add -A
           git commit -m "deploy(${{ inputs.image_name }}): release v${{ steps.ver.outputs.VERSION }}"
