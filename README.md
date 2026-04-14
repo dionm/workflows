@@ -7,14 +7,36 @@ Shared GitHub Actions reusable workflows for Azure App Service container deploym
 Builds an app into a Docker image, pushes to ACR, and deploys to Azure App Service.
 Supports both Node.js-built sites (Gatsby, etc.) and plain static HTML sites.
 
+Implements a **build-once, promote-artefact** pattern: the image is built on `develop`,
+then retagged (not rebuilt) for each subsequent promotion. Production and release deploys
+open a PR in the caller-supplied `gitops_repo`; ArgoCD reconciles on merge.
+
 ### Tag strategy
 
-| Trigger | Image tag | Environment |
+| Trigger | Tags pushed | Deploys via |
 |---|---|---|
-| Push to `develop` | `staging-<sha7>` | staging |
-| Push to `main` | `production-<sha7>` | production |
-| `v*.*.*` tag | `v<semver>` | production |
-| PR | `pr-<number>` | (build only) |
+| PR | `pr-<number>` | not deployed |
+| `develop` push | `staging` + `staging-<sha7>` | ACR webhook restarts staging App Service |
+| `main` push | `production-<sha7>` (retag of staging) | PR to `gitops_repo`; ArgoCD reconciles on merge |
+| `v*.*.*` tag | `v1.2.3` + `v1.2` (retag of production) | PR to `gitops_repo`; ArgoCD reconciles on merge |
+
+The `:staging` tag is floating (updated on every develop push). The App Service is
+configured once to point to `:staging` permanently; ACR continuous deployment handles
+the restart. All other tags are immutable.
+
+### Promotion flow
+
+```
+PR (build + test)
+  -> develop push: build image, push :staging + :staging-<sha7>
+       ACR webhook -> staging App Service restarts automatically
+  -> main push: retag :staging-<sha7> as :production-<sha7>
+       open PR in gitops_repo -> Teams notification with PR link
+       merge PR -> ArgoCD reconciles -> production App Service updated
+  -> v* tag: retag :production-<sha7> as :v1.2.3 + :v1.2
+       open PR in gitops_repo -> Teams notification with PR link
+       merge PR -> ArgoCD reconciles -> production App Service updated
+```
 
 ### Usage
 
@@ -23,9 +45,10 @@ jobs:
   deploy:
     uses: dionm/workflows/.github/workflows/azure-app-service-deploy.yml@v1
     with:
-      image_name: my-app          # required
-      service_name: my-service    # required
-      run_build: true             # false for plain static HTML sites
+      image_name: my-app            # required
+      service_name: my-service      # required
+      gitops_repo: org/my-gitops    # recommended; omit for legacy direct-deploy
+      run_build: true               # false for plain static HTML sites
     secrets: inherit
 ```
 
@@ -35,30 +58,67 @@ jobs:
 |---|---|---|---|
 | `image_name` | yes | | ACR image name (e.g. `spectrum-app`) |
 | `service_name` | yes | | Passed as `SERVICE_NAME` Dockerfile build-arg |
+| `gitops_repo` | no | `''` | GitOps repo for production/release PRs (e.g. `org/homelab-gitops`). When empty, falls back to legacy direct `az webapp` deploy |
 | `node_version` | no | `20` | Node.js version (ignored when `run_build: false`) |
 | `run_build` | no | `true` | Run `npm install` + build before Docker. Set `false` for static HTML sites |
 | `build_command` | no | `npm run build` | Build command (ignored when `run_build: false`) |
 | `dockerfile` | no | `Dockerfile.hybrid` | Dockerfile for CI/CD builds |
-| `health_check_path` | no | `/health` | HTTP path polled after each deploy |
+| `health_check_path` | no | `/health` | HTTP path polled after each deploy (legacy path only) |
 | `gatsby_validation` | no | `false` | Fail if deprecated `gatsby-image` import found |
 | `environment` | no | `''` | Manual override: `staging` or `production` |
 | `skip_tests` | no | `false` | Skip the test job |
 
 ### Required secrets
 
-Pass via `secrets: inherit` or explicitly. All must be set in the calling repo.
+Pass via `secrets: inherit` or explicitly.
 
-| Secret | Shared/per-repo |
-|---|---|
-| `AZURE_CLIENT_ID` | shared (see OIDC section below) |
-| `AZURE_TENANT_ID` | shared |
-| `AZURE_SUBSCRIPTION_ID` | shared |
-| `ACR_LOGIN_SERVER` | shared |
-| `RESOURCE_GROUP_STAGING` | per-repo |
-| `RESOURCE_GROUP_PRODUCTION` | per-repo |
-| `WEBAPP_NAME_STAGING` | per-repo |
-| `WEBAPP_NAME_PRODUCTION` | per-repo |
-| `TEAMS_WEBHOOK_URL` | optional |
+| Secret | Required | Shared/per-repo | Description |
+|---|---|---|---|
+| `AZURE_CLIENT_ID` | yes | shared (see OIDC section) | OIDC app registration client ID |
+| `AZURE_TENANT_ID` | yes | shared | Entra ID tenant |
+| `AZURE_SUBSCRIPTION_ID` | yes | shared | Azure subscription |
+| `ACR_LOGIN_SERVER` | yes | shared | ACR hostname (e.g. `myacr.azurecr.io`) |
+| `GITOPS_TOKEN` | when `gitops_repo` set | per-repo or org | Fine-grained PAT: `Contents: write` + `Pull requests: write` on the gitops repo only |
+| `RESOURCE_GROUP_STAGING` | legacy only | per-repo | |
+| `RESOURCE_GROUP_PRODUCTION` | legacy only | per-repo | |
+| `WEBAPP_NAME_STAGING` | legacy only | per-repo | |
+| `WEBAPP_NAME_PRODUCTION` | legacy only | per-repo | |
+| `TEAMS_WEBHOOK_URL` | no | optional | Teams incoming webhook for notifications |
+
+### ACR continuous deployment (staging)
+
+Configure a webhook from ACR to the staging App Service so that pushing `:staging`
+triggers an automatic container restart. No deploy step is needed in this workflow.
+
+```bash
+# Get the CD webhook URL from the App Service
+WEBHOOK_URL=$(az webapp deployment container show-cd-url \
+  --resource-group <rg-staging> \
+  --name <webapp-staging> \
+  --query CI_CD_URL -o tsv)
+
+# Register the webhook in ACR
+az acr webhook create \
+  --registry <acr-name> \
+  --name <webapp-staging>-cd \
+  --uri "$WEBHOOK_URL" \
+  --actions push \
+  --scope <image-name>:staging
+```
+
+Repeat for each app. The scope `<image-name>:staging` ensures only pushes to the
+`:staging` tag trigger the webhook.
+
+### Jobs
+
+| Job | Trigger | Description |
+|---|---|---|
+| `test` | all (unless skipped) | lint, unit tests, Gatsby validation, security audit |
+| `build` | all | builds image on develop/PR; retags on main/v* |
+| `promote-production` | `main` push | retags staging image, opens PR in gitops_repo (or direct deploy if not set) |
+| `promote-release` | `v*` tag push | retags production image as semver, opens PR in gitops_repo (or direct deploy if not set) |
+
+---
 
 ## OIDC Authentication
 
@@ -108,6 +168,8 @@ done
 
 3. Set `AZURE_CLIENT_ID` in the repo's GitHub secrets.
 4. Update the tables above.
+
+---
 
 ## Versioning
 

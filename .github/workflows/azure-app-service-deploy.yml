@@ -5,9 +5,19 @@ name: Azure App Service Deploy (Reusable)
 # static HTML sites (no npm step needed).
 #
 # Tag strategy:
-#   develop push -> staging-<sha7>    -> staging environment
-#   main push    -> production-<sha7> -> production environment
-#   v* tag       -> v<semver>         -> production environment (release)
+#   develop push -> staging + staging-<sha7>  -> ACR webhook restarts staging App Service
+#   main push    -> production-<sha7> (retag) -> PR to gitops_repo; ArgoCD reconciles
+#   v* tag       -> v<semver> + v<maj>.<min>  -> PR to gitops_repo; ArgoCD reconciles
+#
+# GitOps promotion:
+#   Production and release deploys open a PR in the caller-supplied gitops_repo.
+#   ArgoCD reconciles on merge; the workflow never calls az webapp config container set
+#   for production. Requires GITOPS_TOKEN secret (fine-grained PAT: Contents + PRs write
+#   on the gitops repo only).
+#
+#   Staging uses a floating :staging tag. Configure an ACR continuous deployment
+#   webhook on the staging App Service so pushes trigger an automatic restart.
+#   No deploy step is needed in this workflow for staging.
 
 on:
   workflow_call:
@@ -64,6 +74,15 @@ on:
         required: false
         type: boolean
         default: false
+      gitops_repo:
+        description: |
+          GitOps repo to open promotion PRs against (e.g. org/homelab-gitops).
+          When set, production and release deploys commit the new image tag and
+          open a PR rather than calling az webapp config container set directly.
+          Requires GITOPS_TOKEN secret. Leave empty to use legacy direct-deploy.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   id-token: write
@@ -124,6 +143,10 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # build
+  # develop push: builds image, pushes :staging + :staging-<sha7>
+  # main push:    retags :staging-<sha7> as :production-<sha7> via az acr import
+  # v* tag:       retags :production-<sha7> as :v<semver> + :v<maj>.<min>
+  # PR:           builds image, pushes :pr-<number>
   # ---------------------------------------------------------------------------
   build:
     needs: test
@@ -137,18 +160,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Node build only needed on develop/PR (first build). main and v* retag only.
       - uses: actions/setup-node@v4
-        if: inputs.run_build
+        if: >
+          inputs.run_build &&
+          (github.ref == 'refs/heads/develop' ||
+           startsWith(github.ref, 'refs/pull/'))
         with:
           node-version: ${{ inputs.node_version }}
           cache: npm
 
       - name: Install dependencies
-        if: inputs.run_build
+        if: >
+          inputs.run_build &&
+          (github.ref == 'refs/heads/develop' ||
+           startsWith(github.ref, 'refs/pull/'))
         run: npm ci --legacy-peer-deps || npm install --legacy-peer-deps
 
       - name: Build site
-        if: inputs.run_build
+        if: >
+          inputs.run_build &&
+          (github.ref == 'refs/heads/develop' ||
+           startsWith(github.ref, 'refs/pull/'))
         run: |
           export NODE_OPTIONS="--max-old-space-size=4096"
           ${{ inputs.build_command }}
@@ -156,6 +189,9 @@ jobs:
           echo "Build output: $(du -sh public/ | cut -f1)"
 
       - uses: docker/setup-buildx-action@v4
+        if: >
+          github.ref == 'refs/heads/develop' ||
+          startsWith(github.ref, 'refs/pull/')
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -179,19 +215,24 @@ jobs:
           fi
           echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Extract metadata
+      # --- develop / PR: full docker build + push ----------------------------
+      - name: Extract metadata (develop/PR)
         id: meta
+        if: >
+          github.ref == 'refs/heads/develop' ||
+          startsWith(github.ref, 'refs/pull/')
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ inputs.image_name }}
           tags: |
             type=ref,event=pr,prefix=pr-
-            type=semver,pattern=v{{version}}
-            type=semver,pattern=v{{major}}.{{minor}}
+            type=raw,value=staging,enable=${{ github.ref == 'refs/heads/develop' }}
             type=raw,value=staging-${{ steps.version.outputs.sha_short }},enable=${{ github.ref == 'refs/heads/develop' }}
-            type=raw,value=production-${{ steps.version.outputs.sha_short }},enable=${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build and push Docker image
+      - name: Build and push Docker image (develop/PR)
+        if: >
+          github.ref == 'refs/heads/develop' ||
+          startsWith(github.ref, 'refs/pull/')
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -209,110 +250,122 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # --- main: retag staging-<sha7> as production-<sha7> ------------------
+      - name: Retag staging image as production (main)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          az acr import \
+            --name "${{ env.REGISTRY }}" \
+            --source "${{ env.REGISTRY }}/${{ inputs.image_name }}:staging-${{ steps.version.outputs.sha_short }}" \
+            --image "${{ inputs.image_name }}:production-${{ steps.version.outputs.sha_short }}" \
+            --force
+
+      # --- v* tag: retag production-<sha7> as v<semver> + v<maj>.<min> ------
+      - name: Retag production image as semver (v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          SEMVER="${GITHUB_REF#refs/tags/v}"
+          MINOR="${SEMVER%.*}"
+          az acr import \
+            --name "${{ env.REGISTRY }}" \
+            --source "${{ env.REGISTRY }}/${{ inputs.image_name }}:production-${{ steps.version.outputs.sha_short }}" \
+            --image "${{ inputs.image_name }}:v${SEMVER}" \
+            --force
+          az acr import \
+            --name "${{ env.REGISTRY }}" \
+            --source "${{ env.REGISTRY }}/${{ inputs.image_name }}:production-${{ steps.version.outputs.sha_short }}" \
+            --image "${{ inputs.image_name }}:v${MINOR}" \
+            --force
+
   # ---------------------------------------------------------------------------
-  # deploy-staging
+  # promote-production
+  # Triggered by main push. Opens a PR in gitops_repo to update the image tag.
+  # Falls back to direct az webapp deploy when gitops_repo is not set.
   # ---------------------------------------------------------------------------
-  deploy-staging:
+  promote-production:
     needs: build
-    if: github.ref == 'refs/heads/develop' || inputs.environment == 'staging'
-    runs-on: ubuntu-latest
-    environment: staging
-    name: Deploy to Staging
-
-    steps:
-      - name: Login to Azure
-        uses: azure/login@v3
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Deploy to App Service
-        run: |
-          az webapp config container set \
-            --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
-            --resource-group "${{ secrets.RESOURCE_GROUP_STAGING }}" \
-            --name "${{ secrets.WEBAPP_NAME_STAGING }}" \
-            --container-image-name "${{ env.REGISTRY }}/${{ inputs.image_name }}:staging-${{ needs.build.outputs.sha-short }}" \
-            --container-registry-url "https://${{ env.REGISTRY }}"
-
-      - name: Health check
-        run: |
-          for i in {1..10}; do
-            if curl -f -s "https://${{ secrets.WEBAPP_NAME_STAGING }}.azurewebsites.net${{ inputs.health_check_path }}" > /dev/null; then
-              echo "Health check passed (attempt $i)"; exit 0
-            fi
-            echo "Attempt $i failed, retrying in 30s..."
-            [ "$i" -eq 10 ] && exit 1
-            sleep 30
-          done
-
-      - name: Smoke test
-        run: curl -f -s "https://${{ secrets.WEBAPP_NAME_STAGING }}.azurewebsites.net" > /dev/null
-
-      - name: Notify Teams (success)
-        if: success() && env.TEAMS_WEBHOOK_URL != ''
-        run: |
-          # shellcheck disable=SC2016
-          curl -sSf -H "Content-Type: application/json" -d '{
-            "type": "message",
-            "attachments": [{
-              "contentType": "application/vnd.microsoft.card.adaptive",
-              "content": {
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.2",
-                "body": [
-                  {"type": "TextBlock", "size": "medium", "weight": "bolder", "text": "Staging Deploy: Success"},
-                  {"type": "TextBlock", "text": "**App:** https://${{ secrets.WEBAPP_NAME_STAGING }}.azurewebsites.net\n\n**Commit:** ${{ github.sha }}\n\n**Image:** staging-${{ needs.build.outputs.sha-short }}", "wrap": true}
-                ]
-              }
-            }]
-          }' "${{ env.TEAMS_WEBHOOK_URL }}" || true
-
-      - name: Notify Teams (failure)
-        if: failure() && env.TEAMS_WEBHOOK_URL != ''
-        run: |
-          # shellcheck disable=SC2016
-          curl -sSf -H "Content-Type: application/json" -d '{
-            "type": "message",
-            "attachments": [{
-              "contentType": "application/vnd.microsoft.card.adaptive",
-              "content": {
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.2",
-                "body": [
-                  {"type": "TextBlock", "size": "medium", "weight": "bolder", "text": "Staging Deploy: FAILED", "color": "attention"},
-                  {"type": "TextBlock", "text": "**Commit:** ${{ github.sha }}\n\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "wrap": true}
-                ]
-              }
-            }]
-          }' "${{ env.TEAMS_WEBHOOK_URL }}" || true
-
-  # ---------------------------------------------------------------------------
-  # deploy-production
-  # ---------------------------------------------------------------------------
-  deploy-production:
-    needs: [build, deploy-staging]
-    if: |
-      always() &&
-      needs.build.result == 'success' &&
-      (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped') &&
-      (github.ref == 'refs/heads/main' || inputs.environment == 'production')
+    if: github.ref == 'refs/heads/main' || inputs.environment == 'production'
     runs-on: ubuntu-latest
     environment: production
-    name: Deploy to Production
+    name: Promote to Production
 
     steps:
-      - name: Login to Azure
+      # --- GitOps path -------------------------------------------------------
+      - name: Open GitOps PR (production)
+        id: gitops_pr
+        if: inputs.gitops_repo != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          BRANCH="deploy/${{ inputs.image_name }}-production-${{ needs.build.outputs.sha-short }}"
+          TAG="production-${{ needs.build.outputs.sha-short }}"
+          IMAGE="${{ env.REGISTRY }}/${{ inputs.image_name }}:${TAG}"
+
+          gh repo clone "${{ inputs.gitops_repo }}" gitops-repo -- --depth=1
+          cd gitops-repo
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          # Update image tag - sed targets the image line for this service.
+          # Adjust the pattern if your manifest structure differs.
+          grep -rl "${{ inputs.image_name }}" . --include="*.yaml" --include="*.yml" | head -20 | \
+            xargs sed -i "s|${{ env.REGISTRY }}/${{ inputs.image_name }}:.*|${IMAGE}|g"
+
+          git add -A
+          git commit -m "deploy(${{ inputs.image_name }}): promote production-${{ needs.build.outputs.sha-short }}"
+          git push origin "$BRANCH"
+
+          PR_URL=$(gh pr create \
+            --repo "${{ inputs.gitops_repo }}" \
+            --base main \
+            --head "$BRANCH" \
+            --title "deploy: ${{ inputs.image_name }} production-${{ needs.build.outputs.sha-short }}" \
+            --body "Promote \`${{ inputs.image_name }}\` to production.
+
+          **Image:** \`${IMAGE}\`
+          **Commit:** ${{ github.sha }}
+          **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Merge to deploy. ArgoCD will reconcile on merge.")
+
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Teams - GitOps PR ready for approval
+        if: inputs.gitops_repo != '' && env.TEAMS_WEBHOOK_URL != ''
+        run: |
+          # shellcheck disable=SC2016
+          curl -sSf -H "Content-Type: application/json" -d '{
+            "type": "message",
+            "attachments": [{
+              "contentType": "application/vnd.microsoft.card.adaptive",
+              "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.2",
+                "body": [
+                  {"type": "TextBlock", "size": "medium", "weight": "bolder", "text": "Production Promotion: Approval Required"},
+                  {"type": "TextBlock", "text": "**App:** ${{ inputs.image_name }}\n\n**Image:** production-${{ needs.build.outputs.sha-short }}\n\n**Commit:** ${{ github.sha }}\n\n**PR:** ${{ steps.gitops_pr.outputs.pr_url }}", "wrap": true}
+                ],
+                "actions": [
+                  {"type": "Action.OpenUrl", "title": "Review PR", "url": "${{ steps.gitops_pr.outputs.pr_url }}"}
+                ]
+              }
+            }]
+          }' "${{ env.TEAMS_WEBHOOK_URL }}" || true
+
+      # --- Legacy direct-deploy path (gitops_repo not set) ------------------
+      - name: Login to Azure (legacy)
+        if: inputs.gitops_repo == ''
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to App Service
+      - name: Deploy to App Service (legacy)
+        if: inputs.gitops_repo == ''
         run: |
           az webapp config container set \
             --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
@@ -321,7 +374,8 @@ jobs:
             --container-image-name "${{ env.REGISTRY }}/${{ inputs.image_name }}:production-${{ needs.build.outputs.sha-short }}" \
             --container-registry-url "https://${{ env.REGISTRY }}"
 
-      - name: Health check
+      - name: Health check (legacy)
+        if: inputs.gitops_repo == ''
         run: |
           sleep 60
           for i in {1..15}; do
@@ -333,7 +387,8 @@ jobs:
             sleep 45
           done
 
-      - name: Smoke test
+      - name: Smoke test (legacy)
+        if: inputs.gitops_repo == ''
         run: |
           for i in {1..5}; do
             if curl -f -s "https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net" > /dev/null; then echo "Smoke test passed"; exit 0; fi
@@ -341,8 +396,8 @@ jobs:
             sleep 15
           done
 
-      - name: Notify Teams (success)
-        if: success() && env.TEAMS_WEBHOOK_URL != ''
+      - name: Notify Teams (legacy success)
+        if: inputs.gitops_repo == '' && success() && env.TEAMS_WEBHOOK_URL != ''
         run: |
           # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
@@ -361,8 +416,8 @@ jobs:
             }]
           }' "${{ env.TEAMS_WEBHOOK_URL }}" || true
 
-      - name: Notify Teams (failure)
-        if: failure() && env.TEAMS_WEBHOOK_URL != ''
+      - name: Notify Teams (legacy failure)
+        if: inputs.gitops_repo == '' && failure() && env.TEAMS_WEBHOOK_URL != ''
         run: |
           # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
@@ -382,49 +437,64 @@ jobs:
           }' "${{ env.TEAMS_WEBHOOK_URL }}" || true
 
   # ---------------------------------------------------------------------------
-  # deploy-release  (semver tag push)
+  # promote-release  (semver tag push)
+  # Opens a PR in gitops_repo to update the image tag to vX.Y.Z.
+  # Falls back to direct az webapp deploy when gitops_repo is not set.
   # ---------------------------------------------------------------------------
-  deploy-release:
+  promote-release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: production
-    name: Deploy Release to Production
+    name: Promote Release to Production
 
     steps:
       - name: Get version
         id: ver
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
-      - name: Login to Azure
-        uses: azure/login@v3
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Deploy release to App Service
+      # --- GitOps path -------------------------------------------------------
+      - name: Open GitOps PR (release)
+        id: gitops_pr
+        if: inputs.gitops_repo != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
         run: |
-          az webapp config container set \
-            --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
-            --resource-group "${{ secrets.RESOURCE_GROUP_PRODUCTION }}" \
-            --name "${{ secrets.WEBAPP_NAME_PRODUCTION }}" \
-            --container-image-name "${{ env.REGISTRY }}/${{ inputs.image_name }}:${{ steps.ver.outputs.VERSION }}" \
-            --container-registry-url "https://${{ env.REGISTRY }}"
+          BRANCH="deploy/${{ inputs.image_name }}-v${{ steps.ver.outputs.VERSION }}"
+          TAG="v${{ steps.ver.outputs.VERSION }}"
+          IMAGE="${{ env.REGISTRY }}/${{ inputs.image_name }}:${TAG}"
 
-      - name: Health check
-        run: |
-          sleep 60
-          for i in {1..15}; do
-            if curl -f -s "https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net${{ inputs.health_check_path }}" > /dev/null; then
-              echo "Health check passed (attempt $i)"; exit 0
-            fi
-            [ "$i" -eq 15 ] && exit 1
-            sleep 45
-          done
+          gh repo clone "${{ inputs.gitops_repo }}" gitops-repo -- --depth=1
+          cd gitops-repo
 
-      - name: Notify Teams (success)
-        if: success() && env.TEAMS_WEBHOOK_URL != ''
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          grep -rl "${{ inputs.image_name }}" . --include="*.yaml" --include="*.yml" | head -20 | \
+            xargs sed -i "s|${{ env.REGISTRY }}/${{ inputs.image_name }}:.*|${IMAGE}|g"
+
+          git add -A
+          git commit -m "deploy(${{ inputs.image_name }}): release v${{ steps.ver.outputs.VERSION }}"
+          git push origin "$BRANCH"
+
+          PR_URL=$(gh pr create \
+            --repo "${{ inputs.gitops_repo }}" \
+            --base main \
+            --head "$BRANCH" \
+            --title "release: ${{ inputs.image_name }} v${{ steps.ver.outputs.VERSION }}" \
+            --body "Release \`${{ inputs.image_name }}\` version \`v${{ steps.ver.outputs.VERSION }}\` to production.
+
+          **Image:** \`${IMAGE}\`
+          **Commit:** ${{ github.sha }}
+          **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Merge to deploy. ArgoCD will reconcile on merge.")
+
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Teams - release PR ready for approval
+        if: inputs.gitops_repo != '' && env.TEAMS_WEBHOOK_URL != ''
         run: |
           # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
@@ -436,15 +506,69 @@ jobs:
                 "type": "AdaptiveCard",
                 "version": "1.2",
                 "body": [
-                  {"type": "TextBlock", "size": "medium", "weight": "bolder", "text": "Release Deploy: ${{ steps.ver.outputs.VERSION }}"},
-                  {"type": "TextBlock", "text": "**App:** https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net\n\n**Version:** ${{ steps.ver.outputs.VERSION }}", "wrap": true}
+                  {"type": "TextBlock", "size": "medium", "weight": "bolder", "text": "Release Promotion: Approval Required"},
+                  {"type": "TextBlock", "text": "**App:** ${{ inputs.image_name }}\n\n**Version:** v${{ steps.ver.outputs.VERSION }}\n\n**PR:** ${{ steps.gitops_pr.outputs.pr_url }}", "wrap": true}
+                ],
+                "actions": [
+                  {"type": "Action.OpenUrl", "title": "Review PR", "url": "${{ steps.gitops_pr.outputs.pr_url }}"}
                 ]
               }
             }]
           }' "${{ env.TEAMS_WEBHOOK_URL }}" || true
 
-      - name: Notify Teams (failure)
-        if: failure() && env.TEAMS_WEBHOOK_URL != ''
+      # --- Legacy direct-deploy path (gitops_repo not set) ------------------
+      - name: Login to Azure (legacy)
+        if: inputs.gitops_repo == ''
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy release to App Service (legacy)
+        if: inputs.gitops_repo == ''
+        run: |
+          az webapp config container set \
+            --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            --resource-group "${{ secrets.RESOURCE_GROUP_PRODUCTION }}" \
+            --name "${{ secrets.WEBAPP_NAME_PRODUCTION }}" \
+            --container-image-name "${{ env.REGISTRY }}/${{ inputs.image_name }}:v${{ steps.ver.outputs.VERSION }}" \
+            --container-registry-url "https://${{ env.REGISTRY }}"
+
+      - name: Health check (legacy)
+        if: inputs.gitops_repo == ''
+        run: |
+          sleep 60
+          for i in {1..15}; do
+            if curl -f -s "https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net${{ inputs.health_check_path }}" > /dev/null; then
+              echo "Health check passed (attempt $i)"; exit 0
+            fi
+            [ "$i" -eq 15 ] && exit 1
+            sleep 45
+          done
+
+      - name: Notify Teams (legacy success)
+        if: inputs.gitops_repo == '' && success() && env.TEAMS_WEBHOOK_URL != ''
+        run: |
+          # shellcheck disable=SC2016
+          curl -sSf -H "Content-Type: application/json" -d '{
+            "type": "message",
+            "attachments": [{
+              "contentType": "application/vnd.microsoft.card.adaptive",
+              "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.2",
+                "body": [
+                  {"type": "TextBlock", "size": "medium", "weight": "bolder", "text": "Release Deploy: v${{ steps.ver.outputs.VERSION }} - Success"},
+                  {"type": "TextBlock", "text": "**App:** https://${{ secrets.WEBAPP_NAME_PRODUCTION }}.azurewebsites.net\n\n**Version:** v${{ steps.ver.outputs.VERSION }}", "wrap": true}
+                ]
+              }
+            }]
+          }' "${{ env.TEAMS_WEBHOOK_URL }}" || true
+
+      - name: Notify Teams (legacy failure)
+        if: inputs.gitops_repo == '' && failure() && env.TEAMS_WEBHOOK_URL != ''
         run: |
           # shellcheck disable=SC2016
           curl -sSf -H "Content-Type: application/json" -d '{
@@ -457,7 +581,7 @@ jobs:
                 "version": "1.2",
                 "body": [
                   {"type": "TextBlock", "size": "medium", "weight": "bolder", "text": "Release Deploy: FAILED", "color": "attention"},
-                  {"type": "TextBlock", "text": "**Version:** ${{ steps.ver.outputs.VERSION }}\n\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "wrap": true}
+                  {"type": "TextBlock", "text": "**Version:** v${{ steps.ver.outputs.VERSION }}\n\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "wrap": true}
                 ]
               }
             }]
