@@ -108,7 +108,7 @@ jobs:
     name: Run Tests
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v4
         if: inputs.run_build
@@ -158,7 +158,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Node build only needed on develop/PR (first build). main and v* retag only.
       - uses: actions/setup-node@v4
@@ -221,7 +221,7 @@ jobs:
         if: >
           github.ref == 'refs/heads/develop' ||
           startsWith(github.ref, 'refs/pull/')
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ inputs.image_name }}
           tags: |
@@ -233,7 +233,7 @@ jobs:
         if: >
           github.ref == 'refs/heads/develop' ||
           startsWith(github.ref, 'refs/pull/')
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ inputs.dockerfile }}
