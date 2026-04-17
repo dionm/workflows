@@ -48,10 +48,15 @@ on:
         type: string
         default: 'npm run build'
       dockerfile:
-        description: Dockerfile used by CI/CD builds
+        description: Dockerfile to use (default Dockerfile.hybrid for backward compat)
         required: false
         type: string
         default: 'Dockerfile.hybrid'
+      build_artifact:
+        description: Name of a pre-built artifact to download into public/ before docker build
+        required: false
+        type: string
+        default: ''
       health_check_path:
         description: HTTP path polled after each deploy
         required: false
@@ -228,6 +233,13 @@ jobs:
             type=ref,event=pr,prefix=pr-
             type=raw,value=staging,enable=${{ github.ref == 'refs/heads/develop' }}
             type=raw,value=staging-${{ steps.version.outputs.sha_short }},enable=${{ github.ref == 'refs/heads/develop' }}
+
+      - name: Download pre-built site artifact
+        if: inputs.build_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.build_artifact }}
+          path: public/
 
       - name: Build and push Docker image (develop/PR)
         if: >
