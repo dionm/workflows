@@ -236,7 +236,7 @@ jobs:
 
       - name: Download pre-built site artifact
         if: inputs.build_artifact != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.build_artifact }}
           path: public/
