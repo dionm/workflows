@@ -311,7 +311,8 @@ jobs:
         run: |
           BRANCH="deploy/${{ inputs.image_name }}-production-${{ needs.build.outputs.sha-short }}"
           TAG="production-${{ needs.build.outputs.sha-short }}"
-          IMAGE="${{ env.REGISTRY }}/${{ inputs.image_name }}:${TAG}"
+          IMAGE="${{ inputs.image_name }}:${TAG}"
+          FULL_IMAGE="${{ env.REGISTRY }}/${IMAGE}"
 
           gh repo clone "${{ inputs.gitops_repo }}" gitops-repo -- --depth=1
           cd gitops-repo
@@ -320,10 +321,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
 
-          # Update image tag - sed targets the image line for this service.
-          # Adjust the pattern if your manifest structure differs.
+          # Update image tag in GitOps claims. Claims store short format (image:tag,
+          # no registry prefix) — the Crossplane composition prepends the registry host.
           grep -rl "${{ inputs.image_name }}" . --include="*.yaml" --include="*.yml" | head -20 | \
-            xargs sed -i "s|${{ env.REGISTRY }}/${{ inputs.image_name }}:.*|${IMAGE}|g"
+            xargs sed -i "s|\(${{ inputs.image_name }}\):[^[:space:]\"']*|\1:${TAG}|g"
 
           git add -A
           git commit -m "deploy(${{ inputs.image_name }}): promote production-${{ needs.build.outputs.sha-short }}"
@@ -336,7 +337,7 @@ jobs:
             --title "deploy: ${{ inputs.image_name }} production-${{ needs.build.outputs.sha-short }}" \
             --body "Promote \`${{ inputs.image_name }}\` to production.
 
-          **Image:** \`${IMAGE}\`
+          **Image:** \`${FULL_IMAGE}\`
           **Commit:** ${{ github.sha }}
           **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -474,7 +475,8 @@ jobs:
         run: |
           BRANCH="deploy/${{ inputs.image_name }}-v${{ steps.ver.outputs.VERSION }}"
           TAG="v${{ steps.ver.outputs.VERSION }}"
-          IMAGE="${{ env.REGISTRY }}/${{ inputs.image_name }}:${TAG}"
+          IMAGE="${{ inputs.image_name }}:${TAG}"
+          FULL_IMAGE="${{ env.REGISTRY }}/${IMAGE}"
 
           gh repo clone "${{ inputs.gitops_repo }}" gitops-repo -- --depth=1
           cd gitops-repo
@@ -483,8 +485,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
 
+          # Update image tag in GitOps claims. Claims store short format (image:tag,
+          # no registry prefix) — the Crossplane composition prepends the registry host.
           grep -rl "${{ inputs.image_name }}" . --include="*.yaml" --include="*.yml" | head -20 | \
-            xargs sed -i "s|${{ env.REGISTRY }}/${{ inputs.image_name }}:.*|${IMAGE}|g"
+            xargs sed -i "s|\(${{ inputs.image_name }}\):[^[:space:]\"']*|\1:${TAG}|g"
 
           git add -A
           git commit -m "deploy(${{ inputs.image_name }}): release v${{ steps.ver.outputs.VERSION }}"
@@ -497,7 +501,7 @@ jobs:
             --title "release: ${{ inputs.image_name }} v${{ steps.ver.outputs.VERSION }}" \
             --body "Release \`${{ inputs.image_name }}\` version \`v${{ steps.ver.outputs.VERSION }}\` to production.
 
-          **Image:** \`${IMAGE}\`
+          **Image:** \`${FULL_IMAGE}\`
           **Commit:** ${{ github.sha }}
           **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
