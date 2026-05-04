@@ -38,6 +38,26 @@ PR (build + test)
        merge PR -> ArgoCD reconciles -> production App Service updated
 ```
 
+### GitOps manifest format
+
+Claims in `gitops_repo` must store the image in **short format** — `image: imagename:tag`,
+**without** the registry hostname. The Crossplane `azure-web-application-shared`
+composition prepends the ACR host when constructing `dockerImageName`. Including the
+registry in the claim causes it to be doubled in `linuxFxVersion`.
+
+```yaml
+# ✅ Correct
+runtime:
+  image: spectrum-app:production-cef0847
+
+# ❌ Wrong — causes doubled registry prefix in linuxFxVersion
+runtime:
+  image: devopsmelb.azurecr.io/spectrum-app:production-cef0847
+```
+
+The GitOps sed pattern targets `imagename:[^[:space:]"']*` (matches tag without
+registry prefix, safe across all claim files).
+
 ### Usage
 
 ```yaml
